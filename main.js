@@ -22,9 +22,11 @@ const API_CONFIG = {
     DIAMOND: {
       STATE: "/clicker/diamond/state",
       COMPLETE: "/clicker/diamond/complete",
+      BREATH: "/games/diamond-breath",
     },
     SPACE_TAPPER: {
       SETTINGS: "/hold/space-tappers/game-settings",
+      LAST_RESULT: "/hold/space-tappers/get-last-result",
       SUBMIT_RESULT: "/hold/space-tappers/add-new-result",
     },
     TASKS: {
@@ -74,10 +76,24 @@ const TIME_CONFIG = {
       MAX_PERCENT: 95,
     },
   },
+  DIAMOND_BREATH: {
+    PLAY_TIME: {
+      MIN: 8,
+      MAX: 20,
+    },
+  },
   RANDOM_DELAY: {
     MIN: 10,
     MAX: 60,
     NOISE: 2,
+  },
+};
+
+const GEMS_CONFIG = {
+  GEMS_TYPE: ["quartz", "turquoise", "onyx", "amethyst", "topaz"],
+  GEMS_COUNT: {
+    MIN: 2,
+    MAX: 10,
   },
 };
 
@@ -99,6 +115,26 @@ class Fintopio {
     this.state = {
       firstAccountFinishTime: null,
     };
+  }
+
+  getRandItem(arr) {
+    return arr[Math.floor(Math.random() * arr.length)];
+  }
+
+  getRangeItem(start, end) {
+    return Math.floor(Math.random() * (end - start) + start + 1);
+  }
+
+  readTimestamp(tms) {
+    return new Date(tms).toLocaleString("en-US", {
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: true,
+    });
   }
 
   // =================== Utility Methods ===================
@@ -345,7 +381,34 @@ class Fintopio {
           },
         }
       );
-      return response.data;
+      const response_data = response.data;
+      return response_data;
+    } catch (error) {
+      logger.error(
+        `${colors.error}Error fetching space tapper settings: ${error.message}${colors.reset}`
+      );
+      return null;
+    }
+  }
+
+  async getLastResultTapper(token) {
+    try {
+      const response = await axios.get(
+        `${this.config.baseUrl}${API_CONFIG.ENDPOINTS.SPACE_TAPPER.LAST_RESULT}`,
+        {
+          headers: {
+            ...this.config.headers,
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+      const response_data = response.data;
+      const when = response_data.when;
+      if (when) {
+        return when;
+      }
+      return false;
     } catch (error) {
       logger.error(
         `${colors.error}Error fetching space tapper settings: ${error.message}${colors.reset}`
@@ -356,9 +419,28 @@ class Fintopio {
 
   async submitSpaceTapperResult(token, score = 0) {
     try {
+      /**
+       * new data for space tapper, space tapper cannot be played always!!.
+       * how long the cooldown??? i seen avarage cooldown is 4 hours + 1-2 minutes
+       */
+      const data = JSON.stringify({
+        score: score,
+        collectedGems: Array.from(
+          { length: GEMS_CONFIG.GEMS_TYPE.length },
+          () => ({
+            gem: this.getRandItem(GEMS_CONFIG.GEMS_TYPE),
+            count: this.getRangeItem(
+              GEMS_CONFIG.GEMS_COUNT.MIN,
+              GEMS_CONFIG.GEMS_COUNT.MAX
+            ),
+          })
+        ),
+        additionalGame: false,
+        additionalLiveBoosts: 0,
+      });
       const response = await axios.post(
         `${this.config.baseUrl}${API_CONFIG.ENDPOINTS.SPACE_TAPPER.SUBMIT_RESULT}`,
-        { score },
+        data,
         {
           headers: {
             ...this.config.headers,
@@ -367,14 +449,24 @@ class Fintopio {
           },
         }
       );
-
-      const actualReward = response.data.actualReward;
+      const resp = response.data;
+      const actualReward = resp.actualReward;
+      const availableNext = resp.nextGameAvailableAt;
+      let current_tms = Date.now();
       logger.success(
         `${colors.taskComplete}Space Tapper completed with score: ${score}${colors.reset}`
       );
       logger.info(
         `${colors.faucetSuccess}Received reward: ${actualReward} diamonds${colors.reset}`
       );
+      if (current_tms <= availableNext) {
+        logger.info(
+          `${colors.warning}Next Space Tapper available at: ${
+            colors.green
+          }${this.readTimestamp(availableNext)}${colors.reset}`
+        );
+        return false;
+      }
       return true;
     } catch (error) {
       logger.error(
@@ -384,8 +476,30 @@ class Fintopio {
     }
   }
 
+  calculateNextTapper(when) {
+    let fixedCooldown = 4 * 60 * 60 * 1000 + 2 * 60 * 1000; // fixed 4 hours 2 minutes
+    let lastplayed = new Date(when);
+    let cooldownEnd = new Date(lastplayed.getTime() + fixedCooldown);
+    let current_tms = Date.now();
+    if (current_tms <= cooldownEnd) {
+      let willEnd = this.readTimestamp(cooldownEnd);
+      logger.info(
+        `${colors.warning}Space tapper will be available at: ${colors.green}${willEnd}${colors.reset}`
+      );
+      return false;
+    }
+    return true;
+  }
+
   async handleSpaceTapper(token) {
     try {
+      logger.info(`${colors.green}Checking last playing space tapper!..`);
+      const lastResult = await this.getLastResultTapper(token);
+      const willNext = this.calculateNextTapper(lastResult);
+      if (!willNext) {
+        return;
+      }
+
       const settings = await this.getSpaceTapperSettings(token);
       if (!settings) return;
 
@@ -426,24 +540,30 @@ class Fintopio {
         await this.waitWithCountdown(playTime, "complete Space Tapper", false);
 
         const score = this.generateRandomScore(settings.maxScore);
-        await this.submitSpaceTapperResult(token, score);
-
-        if (i < gamesToPlay - 1) {
-          const betweenGamesDelay =
-            Math.floor(
-              Math.random() *
-                (TIME_CONFIG.SPACE_TAPPER.BETWEEN_GAMES.MAX -
-                  TIME_CONFIG.SPACE_TAPPER.BETWEEN_GAMES.MIN +
-                  1)
-            ) + TIME_CONFIG.SPACE_TAPPER.BETWEEN_GAMES.MIN;
+        const submit_tapper = await this.submitSpaceTapperResult(token, score);
+        if (submit_tapper) {
+          if (i < gamesToPlay - 1) {
+            const betweenGamesDelay =
+              Math.floor(
+                Math.random() *
+                  (TIME_CONFIG.SPACE_TAPPER.BETWEEN_GAMES.MAX -
+                    TIME_CONFIG.SPACE_TAPPER.BETWEEN_GAMES.MIN +
+                    1)
+              ) + TIME_CONFIG.SPACE_TAPPER.BETWEEN_GAMES.MIN;
+            logger.info(
+              `${colors.timerWarn}Waiting ${betweenGamesDelay} seconds before next game...${colors.reset}`
+            );
+            await this.waitWithCountdown(
+              betweenGamesDelay,
+              "next Space Tapper game",
+              false
+            );
+          }
+        } else {
           logger.info(
-            `${colors.timerWarn}Waiting ${betweenGamesDelay} seconds before next game...${colors.reset}`
+            `${colors.warning}Space Tapper ended caused still waiting next available gameplay!${colors.reset}`
           );
-          await this.waitWithCountdown(
-            betweenGamesDelay,
-            "next Space Tapper game",
-            false
-          );
+          break;
         }
       }
     } catch (error) {
@@ -796,6 +916,91 @@ class Fintopio {
     return Math.max(duration.as("milliseconds"), 5000);
   }
 
+  // ============= diamond bretttt ===================
+  calculateBretCooldown(lastplayed, interval = 25200000) {
+    // interval default is 7 hours
+    const lastGame = new Date(lastplayed);
+    const nextGame = new Date(lastGame.getTime() + interval);
+    return this.readTimestamp(nextGame);
+  }
+
+  async diamondBreath(token) {
+    /**
+     * diamond breath cooldown 7 hours....
+     */
+    try {
+      let resp = await axios.get(
+        `${this.config.baseUrl}${API_CONFIG.ENDPOINTS.DIAMOND.BREATH}`,
+        {
+          headers: {
+            ...this.config.headers,
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+      resp = resp.data;
+      if (resp.isAvailableGame) {
+        return true;
+      }
+      let nextGameplay = this.calculateBretCooldown(resp.lastPlayDate);
+      logger.info(
+        `${colors.warning}Next Diamond Breath gameplay available at: ${nextGameplay}${colors.reset}`
+      );
+      return false;
+    } catch (error) {
+      logger.error(
+        `${colors.error}Error diamondBreathing check: ${error.message}${colors.reset}`
+      );
+    }
+  }
+
+  async claimDiamondBreath(token, seconds) {
+    try {
+      const data = JSON.stringify({ seconds: seconds });
+      let resp = await axios.post(
+        `${this.config.baseUrl}${API_CONFIG.ENDPOINTS.DIAMOND.BREATH}`,
+        data,
+        {
+          headers: {
+            ...this.config.headers,
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+      resp = resp.data;
+      logger.success(
+        `${colors.taskComplete}Diamond Breath completed with seconds: ${seconds}${colors.reset}`
+      );
+      logger.info(
+        `${colors.faucetSuccess}Received reward: ${resp.reward} diamonds${colors.reset}`
+      );
+    } catch (error) {
+      logger.error(
+        `${colors.error}Error claiming diamondBreath: ${error.message}${colors.reset}`
+      );
+    }
+  }
+
+  async handlingDiamondBreath(token) {
+    logger.info(`${colors.green}Starting diamond breath game!${colors.reset}`);
+    let isAvailableGame = await this.diamondBreath(token);
+    if (isAvailableGame) {
+      let delay = this.getRangeItem(
+        TIME_CONFIG.DIAMOND_BREATH.PLAY_TIME.MIN,
+        TIME_CONFIG.DIAMOND_BREATH.PLAY_TIME.MAX
+      );
+      await this.waitWithCountdown(delay, "Waiting diamond breath finish!");
+      await this.claimDiamondBreath(token, delay);
+    } else {
+      logger.info(
+        `${colors.warning}Diamond breath gameplay not available yet!${colors.reset}`
+      );
+    }
+    return;
+  }
+
   // =================== Main Process ===================
   async processAccount(userData, accountIndex) {
     const fakeData = FakeDataGenerator.generateFakeData();
@@ -931,6 +1136,7 @@ class Fintopio {
 
     // Then handle other activities in parallel
     await Promise.all([
+      this.handlingDiamondBreath(token),
       this.handleDiamonds(token, accountIndex === 0),
       this.handleFarming(token),
       this.handleTasks(token),
